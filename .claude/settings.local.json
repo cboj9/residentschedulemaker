@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node serve.mjs)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/)",
+      "Read(//usr/local/**)",
+      "Read(//Users/carterbohaboj/.nvm/versions/**)",
+      "Bash(ls /opt/homebrew/bin/node* 2>/dev/null; ls /usr/local/opt/node*/bin/node 2>/dev/null; which python3 || which python)",
+      "Read(//opt/homebrew/**)",
+      "Bash(python3 -m http.server 3000)",
+      "Bash(curl -s http://localhost:3000/)",
+      "Bash(node screenshot.mjs http://localhost:3000 login)",
+      "Bash(gh pr *)"
+    ]
+  }
+}
