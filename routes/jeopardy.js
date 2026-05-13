@@ -1,51 +1,60 @@
 const express = require('express');
-const { getDb } = require('../db/schema');
+const { pool } = require('../db/db');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-router.get('/schedule/:scheduleId', requireAuth, (req, res) => {
-  const db = getDb();
-  const schedule = db.prepare('SELECT * FROM schedules WHERE id = ?').get(req.params.scheduleId);
-  if (!schedule || schedule.program_id !== req.user.programId) return res.status(403).json({ error: 'Forbidden' });
+router.get('/schedule/:scheduleId', requireAuth, async (req, res) => {
+  try {
+    const { rows: [schedule] } = await pool.query('SELECT * FROM schedules WHERE id = $1', [req.params.scheduleId]);
+    if (!schedule || schedule.program_id !== req.user.programId) return res.status(403).json({ error: 'Forbidden' });
 
-  const rows = db.prepare(`
-    SELECT ja.*, r.name as resident_name, r.pgy_year
-    FROM jeopardy_assignments ja
-    JOIN residents r ON r.id = ja.resident_id
-    WHERE ja.schedule_id = ?
-    ORDER BY ja.block_number
-  `).all(req.params.scheduleId);
-
-  res.json(rows);
+    const { rows } = await pool.query(
+      `SELECT ja.*, r.name as resident_name, r.pgy_year
+       FROM jeopardy_assignments ja
+       JOIN residents r ON r.id = ja.resident_id
+       WHERE ja.schedule_id = $1
+       ORDER BY ja.block_number`,
+      [req.params.scheduleId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-router.put('/schedule/:scheduleId/block/:blockNumber', requireAuth, (req, res) => {
-  const db = getDb();
-  const schedule = db.prepare('SELECT * FROM schedules WHERE id = ?').get(req.params.scheduleId);
-  if (!schedule || schedule.program_id !== req.user.programId) return res.status(403).json({ error: 'Forbidden' });
+router.put('/schedule/:scheduleId/block/:blockNumber', requireAuth, async (req, res) => {
+  try {
+    const { rows: [schedule] } = await pool.query('SELECT * FROM schedules WHERE id = $1', [req.params.scheduleId]);
+    if (!schedule || schedule.program_id !== req.user.programId) return res.status(403).json({ error: 'Forbidden' });
 
-  const { resident_id, notes } = req.body;
+    const { resident_id, notes } = req.body;
 
-  if (!resident_id) {
-    db.prepare('DELETE FROM jeopardy_assignments WHERE schedule_id = ? AND block_number = ?')
-      .run(req.params.scheduleId, req.params.blockNumber);
-    return res.json({ cleared: true });
+    if (!resident_id) {
+      await pool.query(
+        'DELETE FROM jeopardy_assignments WHERE schedule_id = $1 AND block_number = $2',
+        [req.params.scheduleId, req.params.blockNumber]
+      );
+      return res.json({ cleared: true });
+    }
+
+    await pool.query(
+      `INSERT INTO jeopardy_assignments (schedule_id, block_number, resident_id, notes)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT(schedule_id, block_number) DO UPDATE SET resident_id = EXCLUDED.resident_id, notes = EXCLUDED.notes`,
+      [req.params.scheduleId, req.params.blockNumber, resident_id, notes || null]
+    );
+
+    const { rows: [result] } = await pool.query(
+      `SELECT ja.*, r.name as resident_name, r.pgy_year
+       FROM jeopardy_assignments ja JOIN residents r ON r.id = ja.resident_id
+       WHERE ja.schedule_id = $1 AND ja.block_number = $2`,
+      [req.params.scheduleId, req.params.blockNumber]
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  db.prepare(`
-    INSERT INTO jeopardy_assignments (schedule_id, block_number, resident_id, notes)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(schedule_id, block_number) DO UPDATE SET resident_id = excluded.resident_id, notes = excluded.notes
-  `).run(req.params.scheduleId, req.params.blockNumber, resident_id, notes || null);
-
-  const result = db.prepare(`
-    SELECT ja.*, r.name as resident_name, r.pgy_year
-    FROM jeopardy_assignments ja JOIN residents r ON r.id = ja.resident_id
-    WHERE ja.schedule_id = ? AND ja.block_number = ?
-  `).get(req.params.scheduleId, req.params.blockNumber);
-
-  res.json(result);
 });
 
 module.exports = router;
