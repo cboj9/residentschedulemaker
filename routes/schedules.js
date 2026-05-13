@@ -104,34 +104,61 @@ router.post('/:id/generate', requireAuth, (req, res) => {
   const halfLen = program.block_length_weeks / 2;
 
   const rotations = db.prepare('SELECT * FROM rotations WHERE program_id = ?').all(program.id);
-  for (const rot of rotations) {
-    rot.pgyRestrictions = db.prepare(
-      'SELECT pgy_year FROM rotation_pgy_restrictions WHERE rotation_id = ?'
-    ).all(rot.id).map(r => r.pgy_year);
-    rot.gapRules = db.prepare(
-      'SELECT * FROM rotation_gap_rules WHERE rotation_id = ?'
-    ).all(rot.id);
-    const pgyReqRows = db.prepare(
-      'SELECT pgy_year, required_blocks FROM rotation_required_by_pgy WHERE rotation_id = ?'
-    ).all(rot.id);
-    rot.pgyRequirements = {};
-    for (const row of pgyReqRows) rot.pgyRequirements[row.pgy_year] = row.required_blocks;
-    rot.ptoEligible = Boolean(rot.pto_eligible);
-    rot.minCapacity = rot.min_capacity;
-    rot.maxCapacity = rot.max_capacity;
-    rot.nightFloat = Boolean(rot.night_float);
-    rot.preferredBlockMin = rot.preferred_block_min ?? null;
-    rot.preferredBlockMax = rot.preferred_block_max ?? null;
-    // two_week flag maps to durationWeeks so the algorithm's isHalfBlock() works correctly
-    rot.durationWeeks = rot.two_week ? halfLen : program.block_length_weeks;
-    rot.canSplitToHalf = Boolean(rot.can_split_to_half);
-    // New per-rotation scheduling constraints
-    rot.callType = rot.call_type || 'none';
-    rot.maxConsecutiveBlocks = rot.max_consecutive_blocks ?? null;
-    rot.continuityClinicalCompatible = Boolean(rot.continuity_clinic_compatible ?? 1);
-    rot.prerequisites = db.prepare(
-      'SELECT prerequisite_rotation_id FROM rotation_prerequisites WHERE rotation_id = ?'
-    ).all(rot.id).map(r => r.prerequisite_rotation_id);
+  if (rotations.length > 0) {
+    const rotIds = rotations.map(r => r.id);
+    const ph = rotIds.map(() => '?').join(',');
+
+    const allPgyRestrictions = db.prepare(
+      `SELECT rotation_id, pgy_year FROM rotation_pgy_restrictions WHERE rotation_id IN (${ph})`
+    ).all(...rotIds);
+    const allGapRules = db.prepare(
+      `SELECT * FROM rotation_gap_rules WHERE rotation_id IN (${ph})`
+    ).all(...rotIds);
+    const allPgyReqRows = db.prepare(
+      `SELECT rotation_id, pgy_year, required_blocks FROM rotation_required_by_pgy WHERE rotation_id IN (${ph})`
+    ).all(...rotIds);
+    const allPrereqs = db.prepare(
+      `SELECT rotation_id, prerequisite_rotation_id FROM rotation_prerequisites WHERE rotation_id IN (${ph})`
+    ).all(...rotIds);
+
+    const pgyRestrictionsMap = {}, gapRulesMap = {}, pgyReqMap = {}, prereqMap = {};
+    for (const row of allPgyRestrictions) {
+      if (!pgyRestrictionsMap[row.rotation_id]) pgyRestrictionsMap[row.rotation_id] = [];
+      pgyRestrictionsMap[row.rotation_id].push(row.pgy_year);
+    }
+    for (const row of allGapRules) {
+      if (!gapRulesMap[row.rotation_id]) gapRulesMap[row.rotation_id] = [];
+      gapRulesMap[row.rotation_id].push(row);
+    }
+    for (const row of allPgyReqRows) {
+      if (!pgyReqMap[row.rotation_id]) pgyReqMap[row.rotation_id] = {};
+      // required_blocks is in half-block units (1 = one 2-week half, 2 = one full 4-week block)
+      // per the algorithm contract — must NOT be converted here
+      pgyReqMap[row.rotation_id][row.pgy_year] = row.required_blocks;
+    }
+    for (const row of allPrereqs) {
+      if (!prereqMap[row.rotation_id]) prereqMap[row.rotation_id] = [];
+      prereqMap[row.rotation_id].push(row.prerequisite_rotation_id);
+    }
+
+    for (const rot of rotations) {
+      rot.pgyRestrictions = pgyRestrictionsMap[rot.id] || [];
+      rot.gapRules        = gapRulesMap[rot.id] || [];
+      rot.pgyRequirements = pgyReqMap[rot.id] || {};
+      rot.prerequisites   = prereqMap[rot.id] || [];
+      rot.ptoEligible     = Boolean(rot.pto_eligible);
+      rot.minCapacity     = rot.min_capacity;
+      rot.maxCapacity     = rot.max_capacity;
+      rot.nightFloat      = Boolean(rot.night_float);
+      rot.preferredBlockMin = rot.preferred_block_min ?? null;
+      rot.preferredBlockMax = rot.preferred_block_max ?? null;
+      // two_week flag maps to durationWeeks so the algorithm's isHalfBlock() works correctly
+      rot.durationWeeks   = rot.two_week ? halfLen : program.block_length_weeks;
+      rot.canSplitToHalf  = Boolean(rot.can_split_to_half);
+      rot.callType        = rot.call_type || 'none';
+      rot.maxConsecutiveBlocks          = rot.max_consecutive_blocks ?? null;
+      rot.continuityClinicalCompatible  = Boolean(rot.continuity_clinic_compatible ?? 1);
+    }
   }
 
   const ptoRequests = db.prepare(`
@@ -208,14 +235,15 @@ router.post('/:id/generate', requireAuth, (req, res) => {
 
         const rotPlaceholders = otherRotIds.map(() => '?').join(',');
         existingCoverage[rotId] = {};
-        for (let b = 1; b <= program.total_blocks; b++) {
-          const count = db.prepare(`
-            SELECT COUNT(*) as cnt FROM assignments a
-            WHERE a.schedule_id IN (${schedPlaceholders})
-              AND a.block_number = ?
-              AND a.rotation_id IN (${rotPlaceholders})
-          `).get(...otherScheduleIds, b, ...otherRotIds)?.cnt || 0;
-          if (count > 0) existingCoverage[rotId][b] = count;
+        const coverageRows = db.prepare(`
+          SELECT a.block_number, COUNT(DISTINCT a.resident_id) as cnt
+          FROM assignments a
+          WHERE a.schedule_id IN (${schedPlaceholders})
+            AND a.rotation_id IN (${rotPlaceholders})
+          GROUP BY a.block_number
+        `).all(...otherScheduleIds, ...otherRotIds);
+        for (const row of coverageRows) {
+          if (row.cnt > 0) existingCoverage[rotId][row.block_number] = row.cnt;
         }
       }
     }

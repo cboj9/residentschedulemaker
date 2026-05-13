@@ -45,9 +45,21 @@
  */
 
 // ── Module-level helpers ───────────────────────────────────────────────────
-function shuffleArray(arr) {
+// mulberry32 — fast, seedable, good distribution for scheduling use
+function makePRNG(seed) {
+  let s = (seed >>> 0) || 0x9E3779B9;
+  return function () {
+    s += 0x6D2B79F5;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function shuffleArray(arr, rand = Math.random) {
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(rand() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
@@ -74,7 +86,10 @@ function generateSchedule({
   // Average users need not set these; the defaults handle typical program sizes well.
   lnsMaxIterations = 40,  // set to 0 to disable
   lnsDestroyRate = 0.35,
+  // Pass an integer seed for fully reproducible output; omit (or null) for random.
+  seed = null,
 }) {
+  const rand = seed != null ? makePRNG(seed) : Math.random;
   const halfLen = blockLengthWeeks / 2;
   if (!Number.isInteger(halfLen)) throw new Error(`blockLengthWeeks must be even; got ${blockLengthWeeks}`);
 
@@ -405,7 +420,10 @@ function generateSchedule({
             if (isOnLeave(r.id, fb)) continue;
             const fbCount = rotBlockCount[rotation.id][fb] || 0;
             const fbExt   = existingCoverage[rotation.id]?.[fb] || 0;
-            if (isGapSatisfied(r, rotation, fb) && fbCount + fbExt < rotation.maxCapacity)
+            if (isGapSatisfied(r, rotation, fb) &&
+                isConsecutiveLimitSatisfied(r, rotation, fb) &&
+                isPrerequisiteSatisfied(r, rotation) &&
+                fbCount + fbExt < rotation.maxCapacity)
               canScheduleLater = true;
           }
           if (!canScheduleLater) count++;
@@ -541,7 +559,11 @@ function generateSchedule({
             score -= W.intensityStackPenalty;
         }
 
-        const consLimit = rotation.maxConsecutiveBlocks ?? maxConsecutiveBlocksSameRotation;
+        const rotConsLimit  = rotation.maxConsecutiveBlocks;
+        const glblConsLimit = maxConsecutiveBlocksSameRotation;
+        const consLimit = rotConsLimit != null && glblConsLimit != null
+          ? Math.min(rotConsLimit, glblConsLimit)
+          : (rotConsLimit ?? glblConsLimit);
         if (consLimit != null) {
           const prevBlock = lastAssignedBlock[resident.id][rotation.id];
           if (prevBlock !== undefined && prevBlock === blockNumber - 1) {
@@ -820,6 +842,7 @@ function generateSchedule({
         if (blockCount + ext >= rotation.maxCapacity) continue;
 
         slot.rotationId = rotation.id;
+        slot.ptoWeeks = [];
         const units = slot.halfBlock === 'full' ? 2 : 1;
         completionCount[resident.id][rotation.id] += units;
         rotBlockCount[rotation.id][slot.blockNumber]++;
@@ -832,6 +855,17 @@ function generateSchedule({
         }
         if (slot.blockNumber > (lastAssignedBlock[resident.id][rotation.id] ?? 0))
           lastAssignedBlock[resident.id][rotation.id] = slot.blockNumber;
+
+        // If block N+1 was already assigned this rotation during the forward pass, extend
+        // the consecutive streak so subsequent swap passes see the correct count.
+        if (allAssignments.some(a =>
+          a.residentId === resident.id &&
+          a.rotationId === rotation.id &&
+          a.blockNumber === slot.blockNumber + 1
+        )) {
+          consecutiveCount[resident.id][rotation.id] =
+            (consecutiveCount[resident.id][rotation.id] || 1) + 1;
+        }
 
         deficit -= units;
       }
@@ -905,6 +939,7 @@ function generateSchedule({
         }
         lastAssignedBlock[resident.id][targetRot.id] = slot.blockNumber;
         slot.rotationId = targetRot.id;
+        slot.ptoWeeks = [];
 
         if (srcRot) {
           const newSrcLast = allAssignments
@@ -984,7 +1019,9 @@ function generateSchedule({
               completionCount[r2.id][rotB.id] += units;
 
               slotR1.rotationId = rotA.id;
+              slotR1.ptoWeeks = [];
               slotR2.rotationId = rotB.id;
+              slotR2.ptoWeeks = [];
 
               if (b > (lastAssignedBlock[r1.id][rotA.id] ?? 0))
                 lastAssignedBlock[r1.id][rotA.id] = b;
@@ -1121,15 +1158,26 @@ function generateSchedule({
           }
         }
 
-        const unfilledCount = allAssignments.filter(
+        const unfilledSlots = allAssignments.filter(
           a => a.residentId === resident.id && a.rotationId === null && !a.pinned
-        ).length;
-        if (unfilledCount > 0 && prefs.length > 0) {
+        );
+        if (unfilledSlots.length > 0 && prefs.length > 0) {
+          let sizeMismatch = false;
+          outer: for (const slot of unfilledSlots) {
+            const slotIsHalf = slot.halfBlock === 'A' || slot.halfBlock === 'B';
+            for (const pref of prefs) {
+              const eRot = electiveRotMap[pref.rotationId];
+              if (!eRot) continue;
+              const eIsHalf = isHalfBlock(eRot);
+              const eIsFull = !eIsHalf && !isFlexible(eRot);
+              if ((slotIsHalf && eIsFull) || (!slotIsHalf && eIsHalf)) { sizeMismatch = true; break outer; }
+            }
+          }
           violations.push({
             type: 'ELECTIVE_UNMATCHED',
             severity: 'warning',
             residentId: resident.id,
-            message: `${resident.name} has ${unfilledCount} elective slot(s) that could not be filled from their ${prefs.length} submitted preference(s)`,
+            message: `${resident.name} has ${unfilledSlots.length} elective slot(s) that could not be filled from their ${prefs.length} submitted preference(s)${sizeMismatch ? '; slot/rotation duration mismatch is a factor' : ''}`,
           });
         }
       }
@@ -1187,6 +1235,26 @@ function generateSchedule({
       seenInBlock[key] = true;
     }
 
+    const seenHalf = {};
+    for (const asgn of allAssignments) {
+      if (!asgn.rotationId) continue;
+      const halves = asgn.halfBlock === 'full' ? ['A', 'B'] : [asgn.halfBlock];
+      for (const h of halves) {
+        const halfKey = `${asgn.residentId}||${asgn.blockNumber}||${h}`;
+        if (seenHalf[halfKey]) {
+          const res = orderedResidents.find(r => r.id === asgn.residentId);
+          violations.push({
+            type: 'HALF_SLOT_CONFLICT',
+            severity: 'error',
+            residentId: asgn.residentId,
+            blockNumber: asgn.blockNumber,
+            message: `${res?.name} has overlapping assignments in block ${asgn.blockNumber} (${h}-half)`,
+          });
+        }
+        seenHalf[halfKey] = true;
+      }
+    }
+
     return { assignments: allAssignments, violations };
   } // end runOnce
 
@@ -1207,7 +1275,7 @@ function generateSchedule({
         if (a.pinned) continue;
         if (!deficitResidents.has(a.residentId)) continue;
         // Always clear null (unfilled) slots; clear others with probability lnsDestroyRate
-        if (a.rotationId === null || Math.random() < lnsDestroyRate) {
+        if (a.rotationId === null || rand() < lnsDestroyRate) {
           destroySet.add(`${a.residentId}|${a.blockNumber}`);
         }
       }
@@ -1252,7 +1320,7 @@ function generateSchedule({
           _ephemeral:  true,
         }));
 
-      const shuffled = shuffleArray([...baseResidents]);
+      const shuffled = shuffleArray([...baseResidents], rand);
       const candidate = runOnce(shuffled, kept);
 
       // Strip ephemeral markers so future rounds can freely destroy these slots
@@ -1270,7 +1338,7 @@ function generateSchedule({
   for (let attempt = 1; attempt < maxRestarts; attempt++) {
     const { errors } = countViolationScore(best);
     if (errors === 0) break;
-    const shuffled = shuffleArray([...residents]);
+    const shuffled = shuffleArray([...residents], rand);
     const candidate = runOnce(shuffled);
     if (isBetter(candidate, best)) best = candidate;
   }
@@ -1322,10 +1390,15 @@ function generateSchedulesMultiProgram({
     for (const [rotId, blockMap] of Object.entries(externalCoverage)) {
       coverage[rotId] = { ...blockMap };
     }
+    const seen = new Set();
     for (const [pid, result] of results) {
       if (pid === excludeProgramId) continue;
       for (const asgn of result.assignments) {
         if (!asgn.rotationId) continue;
+        // Deduplicate by resident so a DOUBLE_ASSIGNMENT violation doesn't inflate cross-program counts
+        const dedupeKey = `${asgn.residentId}|${asgn.rotationId}|${asgn.blockNumber}`;
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
         if (!coverage[asgn.rotationId]) coverage[asgn.rotationId] = {};
         coverage[asgn.rotationId][asgn.blockNumber] =
           (coverage[asgn.rotationId][asgn.blockNumber] || 0) + 1;
